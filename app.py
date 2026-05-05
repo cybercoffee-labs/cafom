@@ -17,6 +17,8 @@ from datetime import date
 import anomaly_detector
 import asset_tracker
 import financial_forecast
+import historical_analysis
+import market_data
 import renewal_alerts
 import report_generator
 import vendor_health
@@ -35,6 +37,30 @@ st.set_page_config(
 # Initialize DB
 db_path = Path(__file__).parent / "data" / "cafom.db"
 asset_tracker.init_db(db_path)
+
+
+def _enrich_with_historical(assets: list[dict]) -> list[dict]:
+    """Merge raw_json fields (incl. historical costs + budget) into each asset.
+
+    The SQLite ledger stores fixed columns; historical_cost_2023/2024/2025
+    and budget_annual_usd live inside raw_json. This helper merges them so
+    Tab 4 (Financial Intelligence) can consume a flat dict per asset.
+    """
+    enriched = []
+    for a in assets:
+        merged = dict(a)
+        raw = a.get("raw_json")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    for k, v in parsed.items():
+                        if merged.get(k) is None:
+                            merged[k] = v
+            except (json.JSONDecodeError, TypeError):
+                pass
+        enriched.append(merged)
+    return enriched
 
 
 def main():
@@ -74,7 +100,7 @@ def main():
 
     # --- Tabs ---
     tab1, tab2, tab3, tab4 = st.tabs(
-        ["Asset Inventory", "Vendor Health", "Renewal Calendar", "Financial Forecast"]
+        ["Asset Inventory", "Vendor Health", "Renewal Calendar", "Financial Intelligence"]
     )
 
     # --- Tab 1: Asset Inventory ---
@@ -230,11 +256,11 @@ def main():
         else:
             st.info("No active renewal alerts.")
 
-    # --- Tab 4: Financial Forecast ---
+    # --- Tab 4: Financial Intelligence ---
     with tab4:
         col_h, col_dl = st.columns([4, 1])
         with col_h:
-            st.header("Financial Forecast & Analytics")
+            st.header("Financial Intelligence")
         with col_dl:
             st.write("")  # vertical spacing
             try:
@@ -249,25 +275,205 @@ def main():
             except Exception as e:
                 st.error(f"Report unavailable: {e}")
 
-        # 12-month projection
-        projection = financial_forecast.project_12_months(assets)
+        enriched = _enrich_with_historical(assets)
+
+        # ----- Section A: Historical Spend 2023-2026 -----
+        st.subheader("📊 Section A — Historical Spend 2023-2026")
+        hist = historical_analysis.get_historical_spend(enriched)
+        yearly = hist["yearly_totals"]
+        if any(v > 0 for v in yearly.values()):
+            df_hist = pd.DataFrame({
+                "Year": [str(y) for y in yearly.keys()],
+                "Total Spend (USD)": list(yearly.values()),
+            }).set_index("Year")
+            st.bar_chart(df_hist)
+
+            yoy = hist["yoy_change"]
+            cagr = hist["cagr_pct"]
+            total_growth = hist["total_growth_pct"]
+
+            kpi_cols = st.columns(4)
+            with kpi_cols[0]:
+                st.metric(
+                    "YoY 2024",
+                    f"{yoy.get(2024):.1f}%" if yoy.get(2024) is not None else "n/a",
+                )
+            with kpi_cols[1]:
+                st.metric(
+                    "YoY 2025",
+                    f"{yoy.get(2025):.1f}%" if yoy.get(2025) is not None else "n/a",
+                )
+            with kpi_cols[2]:
+                st.metric(
+                    "YoY 2026",
+                    f"{yoy.get(2026):.1f}%" if yoy.get(2026) is not None else "n/a",
+                )
+            with kpi_cols[3]:
+                st.metric(
+                    "CAGR 2023-2026",
+                    f"{cagr:.2f}%" if cagr is not None else "n/a",
+                    delta=f"{total_growth:.1f}% total" if total_growth is not None else None,
+                )
+        else:
+            st.info("Historical cost fields not present on assets.")
+
+        st.divider()
+
+        # ----- Section B: Market Context -----
+        st.subheader("📈 Section B — Market Context: Spend Growth vs Sector Stock Index")
+        st.caption("Indexed to 1.0 at start of 2023. Internal spend rebased to same baseline for direct comparison.")
+        try:
+            with st.spinner("Loading market data (yfinance)…"):
+                sector = market_data.get_sector_index()
+            if sector["values"]:
+                # Build a unified frame: sector index + spend growth (rebased to 1.0)
+                df_sector = pd.DataFrame({
+                    "Date": pd.to_datetime(sector["dates"]),
+                    "Sector Index": sector["values"],
+                }).set_index("Date")
+
+                if any(v > 0 for v in yearly.values()) and yearly[2023] > 0:
+                    spend_index = {
+                        f"{y}-01-01": yearly[y] / yearly[2023]
+                        for y in [2023, 2024, 2025, 2026]
+                    }
+                    df_spend = pd.DataFrame({
+                        "Date": pd.to_datetime(list(spend_index.keys())),
+                        "Spend Growth": list(spend_index.values()),
+                    }).set_index("Date")
+                    combined = df_sector.join(df_spend, how="outer").ffill()
+                else:
+                    combined = df_sector
+
+                st.line_chart(combined)
+                st.caption(
+                    f'**{sector["label"]}** — Tickers used: '
+                    f'{", ".join(sector["tickers_used"]) or "none"}'
+                )
+                if sector["tickers_missing"]:
+                    st.caption(
+                        f'⚠️ Tickers unavailable (skipped): {", ".join(sector["tickers_missing"])}'
+                    )
+            else:
+                st.warning(
+                    "Sector index unavailable (no tickers downloaded). "
+                    "Network or yfinance issue — graceful skip applied."
+                )
+        except Exception as e:
+            st.warning(f"Market data unavailable: {e}")
+
+        st.divider()
+
+        # ----- Section C: Vendor Concentration -----
+        st.subheader("🥧 Section C — Vendor Concentration")
+        conc = historical_analysis.get_vendor_concentration(enriched)
+        if conc["per_vendor"]:
+            top_col, hhi_col = st.columns(2)
+            with top_col:
+                st.metric(
+                    "Top Vendor",
+                    conc["top_vendor"] or "n/a",
+                    delta=f'{conc["top_pct"]:.1f}% of total spend',
+                )
+            with hhi_col:
+                st.metric(
+                    "HHI Concentration",
+                    f'{conc["hhi"]:.0f}',
+                    help="Herfindahl-Hirschman Index — <1500 unconcentrated, 1500-2500 moderate, >2500 high",
+                )
+
+            # Pie chart via matplotlib (Streamlit's bar_chart doesn't do pies)
+            try:
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(6, 6))
+                labels = [r["vendor"] for r in conc["per_vendor"]]
+                sizes = [r["total"] for r in conc["per_vendor"]]
+                ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=140)
+                ax.axis("equal")
+                st.pyplot(fig)
+                plt.close(fig)
+            except Exception as e:
+                # Fallback: bar chart of vendor totals
+                df_conc = pd.DataFrame(conc["per_vendor"]).set_index("vendor")[["total"]]
+                st.bar_chart(df_conc)
+        else:
+            st.info("No vendor spend data available.")
+
+        st.divider()
+
+        # ----- Section D: Monthly Burn Rate -----
+        st.subheader("🔥 Section D — Monthly Burn Rate (Actual vs Budget)")
+        burn = historical_analysis.get_burn_rate(enriched)
+        if burn["months"]:
+            df_burn = pd.DataFrame({
+                "Month": burn["months"],
+                "Actual": burn["actual"],
+                "Budget": burn["budget"],
+            }).set_index("Month")
+            st.bar_chart(df_burn)
+
+            burn_cols = st.columns(3)
+            with burn_cols[0]:
+                st.metric("Total Actual", f'${burn["total_actual"]:,.0f}')
+            with burn_cols[1]:
+                st.metric("Total Budget", f'${burn["total_budget"]:,.0f}')
+            with burn_cols[2]:
+                variance = burn["variance_pct"]
+                st.metric(
+                    "Variance",
+                    f"{variance:+.2f}%",
+                    delta="Under budget" if variance < 0 else "Over budget",
+                    delta_color="normal" if variance < 0 else "inverse",
+                )
+        else:
+            st.info("Burn rate unavailable.")
+
+        st.divider()
+
+        # ----- Section E: Cost Anomalies (4-Year Baseline) -----
+        st.subheader("⚠️ Section E — Cost Anomalies (4-Year Baseline)")
+        st.caption("Improved detection: baseline = mean ± 2σ across **all category cost observations 2023-2026** (instead of single-year only).")
+        improved = historical_analysis.get_improved_anomalies(enriched)
+        if improved:
+            improved_df = pd.DataFrame(improved)
+            display_cols = [
+                "id", "product", "vendor", "category",
+                "annual_cost_usd", "baseline_mean", "threshold", "observations_count",
+            ]
+            display_cols = [c for c in display_cols if c in improved_df.columns]
+            st.dataframe(improved_df[display_cols], use_container_width=True)
+        else:
+            st.success("✅ No cost anomalies — all 2026 costs within 4-year category baselines.")
+
+        # Also show legacy single-year detection for comparison
+        legacy = anomaly_detector.flag_outliers(enriched)
+        if legacy:
+            with st.expander("Compare with single-year detection (legacy)"):
+                legacy_df = pd.DataFrame(legacy)
+                cols = [c for c in ["id", "product", "vendor", "annual_cost_usd", "threshold"] if c in legacy_df.columns]
+                st.dataframe(legacy_df[cols], use_container_width=True)
+
+        st.divider()
+
+        # ----- Section F: 12-Month Forecast (existing) -----
+        st.subheader("📅 Section F — 12-Month Cost Projection")
+        projection = financial_forecast.project_12_months(enriched)
         if projection:
             df_forecast = pd.DataFrame(projection)
-            st.subheader("12-Month Cost Projection")
             st.line_chart(df_forecast.set_index("month_name")[["projected_cost"]])
             st.dataframe(df_forecast, use_container_width=True)
 
         st.divider()
 
-        # CAPEX vs OPEX
+        # CAPEX vs OPEX (preserved from original)
         capex_sum = sum(
             float(a.get("annual_cost_usd", 0) or 0)
-            for a in assets
+            for a in enriched
             if a.get("capex_opex") == "CAPEX"
         )
         opex_sum = sum(
             float(a.get("annual_cost_usd", 0) or 0)
-            for a in assets
+            for a in enriched
             if a.get("capex_opex") == "OPEX"
         )
 
@@ -280,17 +486,6 @@ def main():
             with col2:
                 st.metric("Total CAPEX", f"${capex_sum:,.2f}")
                 st.metric("Total OPEX", f"${opex_sum:,.2f}")
-
-        st.divider()
-
-        # Anomalies
-        outliers = anomaly_detector.flag_outliers(assets)
-        if outliers:
-            st.subheader("⚠️ Cost Anomalies (Mean + 2σ)")
-            outlier_df = pd.DataFrame(outliers)
-            st.dataframe(outlier_df[["id", "product", "vendor", "annual_cost_usd", "threshold"]], use_container_width=True)
-        else:
-            st.info("No cost anomalies detected.")
 
 
 if __name__ == "__main__":
