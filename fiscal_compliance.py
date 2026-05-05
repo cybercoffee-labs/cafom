@@ -20,6 +20,9 @@ Entry points:
 * :func:`validate_art_30_b` — per-asset surveillance / data integrity score
 * :func:`verify_efos_status` — per-vendor EFOS-listing review
 * :func:`get_fiscal_risk_index` — overall portfolio fiscal risk index
+* :func:`get_asset_deductibility` — Art. 25 LISR deductibility per asset
+* :func:`fiscal_healthcheck` — live state of RAG and contable_bot bridges
+* :func:`warm_rag_cache` — opt-in pre-fetch of Art. 30-B / 69-B answers
 * :func:`is_rag_available` — predicate the dashboard can use to label cards
 """
 
@@ -30,6 +33,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 logger = logging.getLogger("cafom.fiscal_compliance")
@@ -56,6 +60,35 @@ except ImportError as exc:
     logger.info("contable_bot RAG bridge unavailable: %s — using hardcoded legal summaries", exc)
 except Exception as exc:  # pragma: no cover — defensive
     logger.warning("Unexpected error importing rag.query: %s", exc)
+
+
+# --------------------------------------------------------------------------
+# Bridge to contable_bot fiscal calculators (reuse, don't redefine)
+# --------------------------------------------------------------------------
+# Both modules already import cleanly because _CONTABLE_BOT_PATH is on
+# sys.path from the RAG bridge above. Failures degrade gracefully.
+
+_FISCAL_CONSTANTS: Any = None    # exposes UMA_2026_*, ISR_BRACKETS_2026_ANNUAL, ...
+_ISR_CALCULATOR: Any = None      # exposes marginal_rate_for_income, apply_isr_progressive
+
+try:
+    from core import fiscal_constants as _FISCAL_CONSTANTS  # type: ignore[no-redef]
+    logger.info("contable_bot.core.fiscal_constants bridge enabled")
+except Exception as exc:  # noqa: BLE001
+    logger.info("contable_bot.core.fiscal_constants unavailable: %s", exc)
+
+try:
+    from core import isr_calculator as _ISR_CALCULATOR  # type: ignore[no-redef]
+    logger.info("contable_bot.core.isr_calculator bridge enabled")
+except Exception as exc:  # noqa: BLE001
+    logger.info("contable_bot.core.isr_calculator unavailable: %s", exc)
+
+
+# Tasa fija de ISR para personas morales — Art. 9 LISR. No depende de la
+# tarifa progresiva del Art. 96 (esa es para personas físicas). La cifra
+# ha sido 30 % de forma estable; se cita aquí como Decimal para evitar
+# imprecisiones de float en el cálculo de ahorros estimados.
+_CORP_ISR_RATE: Decimal = Decimal("0.30")
 
 
 _DISABLE_RAG_ENV = os.environ.get("CAFOM_DISABLE_RAG", "").strip().lower() in {"1", "true", "yes"}
@@ -516,4 +549,190 @@ def get_fiscal_risk_index(assets: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "thresholds": {"bajo_max": 30, "revision_max": 60},
         "recommendations": recommendations,
+    }
+
+
+# --------------------------------------------------------------------------
+# Asset deductibility — Art. 25 LISR (reuses contable_bot when available)
+# --------------------------------------------------------------------------
+
+
+def get_asset_deductibility(asset: dict[str, Any]) -> dict[str, Any]:
+    """
+    Estimate the deductibility of a CAFOM cybersecurity asset under Mexican
+    income tax law (Art. 25 LISR — gastos estrictamente indispensables).
+
+    Logic:
+      * **Active OPEX** → fully deductible the year it is incurred
+        (Art. 25 fr. III LISR).
+      * **Active CAPEX** → depreciable equipo de cómputo at 30 % straight-line
+        per year (Art. 31, 32, 34 fr. VII LISR). Returns this year's portion.
+      * **Decommissioned / Expired** → not currently deductible; assets dados
+        de baja require formal SAT process (Art. 32 LISR).
+
+    Estimated tax savings use the personas-morales fixed rate (30 % per
+    Art. 9 LISR). When ``contable_bot.core.isr_calculator`` is loaded we
+    additionally surface ``marginal_rate_pf`` — the personas-físicas marginal
+    rate at this cost level — useful for the sister fiscal-investment
+    analyzer audience that wants to compare corporate vs personal treatment.
+
+    Pure function, no I/O. Falls back to a fixed corporate rate when the
+    contable_bot bridge is offline; the ``uses_contable_bot_constants`` flag
+    in the result reports which mode was used.
+    """
+    cost = 0.0
+    raw_cost = asset.get("annual_cost_usd")
+    if raw_cost is not None:
+        try:
+            cost = float(raw_cost)
+        except (TypeError, ValueError):
+            cost = 0.0
+
+    capex_opex = (asset.get("capex_opex") or "OPEX").upper()
+    status = (asset.get("status") or "Active").strip()
+
+    # Decision tree
+    if status in {"Decommissioned", "Expired"}:
+        is_deductible = False
+        deductible_fraction = 0.0
+        legal_basis = (
+            "Art. 32 LISR — los activos dados de baja requieren proceso "
+            "formal ante el SAT antes de aplicar deducción."
+        )
+    elif capex_opex == "CAPEX":
+        is_deductible = True
+        # Equipo de cómputo: 30 % anual, Art. 34 fr. VII LISR.
+        deductible_fraction = 0.30
+        legal_basis = (
+            "Art. 31, 32 y 34 fr. VII LISR — depreciación de equipo de "
+            "cómputo y software al 30 % anual en línea recta."
+        )
+    else:  # OPEX, the common case for SaaS / subscription tools
+        is_deductible = True
+        deductible_fraction = 1.00
+        legal_basis = (
+            "Art. 25 fr. III LISR — gastos estrictamente indispensables "
+            "para la operación del contribuyente; las suscripciones de "
+            "ciberseguridad son deducibles en el ejercicio en que se "
+            "devengan."
+        )
+
+    deductible_amount = round(cost * deductible_fraction, 2)
+    estimated_savings = round(deductible_amount * float(_CORP_ISR_RATE), 2)
+
+    # Optional enrichment: personas-físicas marginal rate at this cost level
+    marginal_rate_pf: float | None = None
+    uses_constants = False
+    if _ISR_CALCULATOR is not None:
+        try:
+            rate = _ISR_CALCULATOR.marginal_rate_for_income(Decimal(str(cost)))
+            marginal_rate_pf = float(rate)
+            uses_constants = True
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("isr_calculator marginal_rate_for_income failed: %s", exc)
+
+    return {
+        "id": asset.get("id"),
+        "product": asset.get("product"),
+        "vendor": asset.get("vendor"),
+        "category": asset.get("category"),
+        "capex_opex": capex_opex,
+        "status": status,
+        "annual_cost_usd": cost,
+        "is_deductible": is_deductible,
+        "deductible_fraction": deductible_fraction,
+        "deductible_amount_usd": deductible_amount,
+        "corp_isr_rate": float(_CORP_ISR_RATE),
+        "estimated_isr_savings_usd": estimated_savings,
+        "marginal_rate_pf": marginal_rate_pf,
+        "legal_basis": legal_basis,
+        "uses_contable_bot_constants": uses_constants,
+    }
+
+
+# --------------------------------------------------------------------------
+# Operational helpers — RAG cache warm-up and full health check
+# --------------------------------------------------------------------------
+
+
+def warm_rag_cache() -> dict[str, Any]:
+    """
+    Pre-fetch the Art. 30-B and 69-B RAG answers so the Streamlit dashboard
+    paints fast on the first request.
+
+    Safe to call multiple times — :data:`_RAG_CACHE` deduplicates by
+    question. Returns a small status dict suitable for logging or a UI
+    "RAG warmed" indicator.
+    """
+    art30 = _ask_rag(
+        "¿Qué obligaciones impone el Artículo 30-B del Código Fiscal de la "
+        "Federación sobre la vigilancia permanente de sistemas tecnológicos "
+        "y la integridad de la información fiscal?",
+        fallback=_FALLBACK_ART_30B,
+        category_filter=("fiscal",),
+    )
+    art69 = _ask_rag(
+        "Explica el Artículo 69-B del Código Fiscal de la Federación sobre "
+        "Empresas Facturadoras de Operaciones Simuladas (EFOS), las "
+        "obligaciones del contribuyente que recibe comprobantes de un "
+        "presunto EFOS, y cómo verificar el listado SAT.",
+        fallback=_FALLBACK_ART_69B,
+        category_filter=("fiscal",),
+    )
+    return {
+        "art_30b_source": art30.get("source"),
+        "art_30b_citation_count": len(art30.get("citations") or []),
+        "art_69b_source": art69.get("source"),
+        "art_69b_citation_count": len(art69.get("citations") or []),
+        "cache_size": len(_RAG_CACHE),
+    }
+
+
+def fiscal_healthcheck() -> dict[str, Any]:
+    """
+    Report the live state of every external dependency this module relies on.
+
+    Cheap by design — only inspects module-level state, no network or LLM
+    calls. Callers wanting an end-to-end probe should run
+    :func:`warm_rag_cache` first and then call this.
+
+    Returns a dict with:
+      * ``status``: ``"full"`` (RAG live + both fiscal modules), ``"partial"``
+        (some bridges up), or ``"offline"`` (none available).
+      * ``rag``: imported / disabled-via-env / live / warmed / cache_size.
+      * ``imports``: dict of bridge module name → bool.
+      * ``components_up`` / ``components_total``: roll-up of bridges loaded.
+    """
+    rag_imported = _RAG_QUERY is not None
+    rag_disabled_env = _DISABLE_RAG_ENV
+    rag_live = rag_imported and not rag_disabled_env
+    rag_warmed = bool(_RAG_CACHE)
+
+    imports = {
+        "rag.query": rag_imported,
+        "core.fiscal_constants": _FISCAL_CONSTANTS is not None,
+        "core.isr_calculator": _ISR_CALCULATOR is not None,
+    }
+    components_up = sum(1 for v in imports.values() if v)
+
+    if rag_live and components_up == 3:
+        status = "full"
+    elif components_up >= 1:
+        status = "partial"
+    else:
+        status = "offline"
+
+    return {
+        "status": status,
+        "rag": {
+            "imported": rag_imported,
+            "disabled_via_env": rag_disabled_env,
+            "live": rag_live,
+            "warmed": rag_warmed,
+            "cache_size": len(_RAG_CACHE),
+        },
+        "imports": imports,
+        "contable_bot_path": _CONTABLE_BOT_PATH,
+        "components_up": components_up,
+        "components_total": 3,
     }
