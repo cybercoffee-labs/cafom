@@ -18,6 +18,7 @@ import anomaly_detector
 import asset_tracker
 import executive_kpis
 import financial_forecast
+import fiscal_compliance
 import historical_analysis
 import market_data
 import renewal_alerts
@@ -100,9 +101,13 @@ def main():
     st.divider()
 
     # --- Tabs ---
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Asset Inventory", "Vendor Health", "Renewal Calendar", "Financial Intelligence"]
-    )
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Asset Inventory",
+        "Vendor Health",
+        "Renewal Calendar",
+        "Financial Intelligence",
+        "Fiscal Compliance MX",
+    ])
 
     # --- Tab 1: Asset Inventory ---
     with tab1:
@@ -592,6 +597,243 @@ def main():
             with col2:
                 st.metric("Total CAPEX", f"${capex_sum:,.2f}")
                 st.metric("Total OPEX", f"${opex_sum:,.2f}")
+
+    # --- Tab 5: Fiscal Compliance MX ---
+    with tab5:
+        st.header("🇲🇽 Fiscal Compliance MX")
+
+        # RAG status banner — built from fiscal_healthcheck()
+        hc = fiscal_compliance.fiscal_healthcheck()
+        status_emoji = {"full": "🟢", "partial": "🟡", "offline": "🔴"}[hc["status"]]
+        rag_label = "live" if hc["rag"]["live"] else "offline (fallback)"
+        st.caption(
+            f"{status_emoji} **Status:** {hc['status']} · "
+            f"RAG: {rag_label} · "
+            f"Components: {hc['components_up']}/{hc['components_total']} "
+            f"(rag.query: {hc['imports']['rag.query']} · "
+            f"core.fiscal_constants: {hc['imports']['core.fiscal_constants']} · "
+            f"core.isr_calculator: {hc['imports']['core.isr_calculator']})"
+        )
+        st.caption(
+            "_Powered by contable_bot RAG — 82 Mexican fiscal documents. "
+            "Not legal advice._"
+        )
+        st.divider()
+
+        fiscal_assets = _enrich_with_historical(assets)
+
+        # ----- Section A: Art. 30-B CFF -----
+        st.subheader("📜 Section A — Art. 30-B CFF · Vigilancia Permanente")
+        art30 = fiscal_compliance.validate_art_30_b(fiscal_assets)
+        legal_a = art30["legal"]
+        st.caption(
+            f'**{legal_a["article"]}** · {legal_a["law"]} · '
+            f'source: `{legal_a["source"]}`'
+        )
+
+        a_summary = art30["summary"]
+        a_kpis = st.columns(4)
+        with a_kpis[0]:
+            st.metric("Total Assessed", a_summary["total_assessed"])
+        with a_kpis[1]:
+            st.metric("🔴 Alto", a_summary["alto"])
+        with a_kpis[2]:
+            st.metric("🟡 Medio", a_summary["medio"])
+        with a_kpis[3]:
+            st.metric("🟢 Bajo", a_summary["bajo"])
+
+        if art30["items"]:
+            df_a = pd.DataFrame(art30["items"])
+            display_a = [c for c in [
+                "id", "product", "vendor", "category", "status",
+                "risk_level", "surveillance_clause_required", "sat_readiness_score",
+            ] if c in df_a.columns]
+
+            def _risk_color(val):
+                if val == "Alto":
+                    return "background-color: #4a0000; color: #ffaaaa"
+                if val == "Medio":
+                    return "background-color: #5a3a00; color: #ffd9a3"
+                if val == "Bajo":
+                    return "background-color: #003a1a; color: #aaffcf"
+                return ""
+
+            styled_a = df_a[display_a].style.map(_risk_color, subset=["risk_level"])
+            st.dataframe(styled_a, use_container_width=True, hide_index=True)
+
+        with st.expander("📚 RAG / Legal answer (Art. 30-B)"):
+            st.write(legal_a["answer"])
+            cits = legal_a.get("citations") or []
+            if cits:
+                st.markdown("**Citations:**")
+                for c in cits[:4]:
+                    st.markdown(
+                        f"- *{c.get('article', '')}* — {c.get('source_file', '')} "
+                        f"(score: {c.get('score', 0):.3f})"
+                    )
+                    excerpt = c.get("excerpt") or ""
+                    if excerpt:
+                        st.caption(excerpt[:280])
+
+        st.divider()
+
+        # ----- Section B: EFOS Verification (Art. 69-B) -----
+        st.subheader("🚩 Section B — Art. 69-B CFF · EFOS Verification")
+        vendor_names = sorted({a.get("vendor") for a in fiscal_assets if a.get("vendor")})
+        efos = fiscal_compliance.verify_efos_status(list(vendor_names))
+        legal_b = efos["legal"]
+        st.caption(
+            f'**{legal_b["article"]}** · {legal_b["law"]} · '
+            f'source: `{legal_b["source"]}`'
+        )
+
+        b_summary = efos["summary"]
+        b_kpis = st.columns(3)
+        with b_kpis[0]:
+            st.metric("Total Vendors", b_summary["total_vendors"])
+        with b_kpis[1]:
+            st.metric("✅ Verified", b_summary["clean"])
+        with b_kpis[2]:
+            st.metric(
+                "⚠️ Needs Review",
+                b_summary["needs_review"],
+                delta=("ok" if b_summary["needs_review"] == 0 else "action"),
+                delta_color=(
+                    "normal" if b_summary["needs_review"] == 0 else "inverse"
+                ),
+            )
+
+        if efos["items"]:
+            df_b = pd.DataFrame(efos["items"])
+
+            def _efos_color(val):
+                if val == "Revisión requerida":
+                    return "background-color: #4a0000; color: #ffaaaa"
+                if val == "Limpio":
+                    return "background-color: #003a1a; color: #aaffcf"
+                return ""
+
+            styled_b = df_b.style.map(_efos_color, subset=["efos_status"])
+            st.dataframe(styled_b, use_container_width=True, hide_index=True)
+
+        with st.expander("📚 RAG / Legal answer (Art. 69-B)"):
+            st.write(legal_b["answer"])
+            cits = legal_b.get("citations") or []
+            if cits:
+                st.markdown("**Citations:**")
+                for c in cits[:4]:
+                    st.markdown(
+                        f"- *{c.get('article', '')}* — {c.get('source_file', '')} "
+                        f"(score: {c.get('score', 0):.3f})"
+                    )
+                    excerpt = c.get("excerpt") or ""
+                    if excerpt:
+                        st.caption(excerpt[:280])
+
+        st.divider()
+
+        # ----- Section C: Fiscal Risk Index -----
+        st.subheader("📊 Section C — Fiscal Risk Index")
+        idx = fiscal_compliance.get_fiscal_risk_index(fiscal_assets)
+        score = idx["score"]
+        band = idx["band"]
+        band_emoji = {"Bajo": "🟢", "Revisión": "🟡", "Acción": "🔴"}.get(band, "⚪")
+
+        c_kpis = st.columns(3)
+        with c_kpis[0]:
+            st.metric(
+                "Risk Score (0-100)",
+                f"{score:.2f}",
+                delta=f"{band_emoji} {band}",
+                delta_color=(
+                    "normal" if band == "Bajo"
+                    else "off" if band == "Revisión"
+                    else "inverse"
+                ),
+            )
+        with c_kpis[1]:
+            st.metric(
+                "Art. 30-B avg",
+                f"{idx['components']['art_30b_avg_score']:.1f}",
+                help="Average SAT readiness score across portfolio",
+            )
+        with c_kpis[2]:
+            st.metric(
+                "EFOS review %",
+                f"{idx['components']['efos_review_pct']:.1f}%",
+                help="% of vendors needing Art. 69-B review",
+            )
+
+        # Show progress bar visualization for the risk score
+        st.progress(min(score / 100.0, 1.0))
+        st.caption(
+            f"Bands: <{idx['thresholds']['bajo_max']} Bajo · "
+            f"{idx['thresholds']['bajo_max']}-{idx['thresholds']['revision_max']} Revisión · "
+            f">{idx['thresholds']['revision_max']} Acción"
+        )
+
+        st.markdown("**Recommendations:**")
+        for rec in idx["recommendations"]:
+            st.markdown(f"- {rec}")
+
+        st.divider()
+
+        # ----- Section D: Deductibility (Art. 25 LISR) -----
+        st.subheader("💰 Section D — Deductibility · Art. 25 LISR")
+        deductibility_items = [
+            fiscal_compliance.get_asset_deductibility(a) for a in fiscal_assets
+        ]
+        if deductibility_items:
+            df_d = pd.DataFrame(deductibility_items)
+            total_deductible = sum(r["deductible_amount_usd"] for r in deductibility_items)
+            total_savings = sum(r["estimated_isr_savings_usd"] for r in deductibility_items)
+            deductible_count = sum(1 for r in deductibility_items if r["is_deductible"])
+
+            d_kpis = st.columns(4)
+            with d_kpis[0]:
+                st.metric("Deductible Assets", f"{deductible_count} / {len(deductibility_items)}")
+            with d_kpis[1]:
+                st.metric("Total Deductible", f"${total_deductible:,.0f}")
+            with d_kpis[2]:
+                st.metric(
+                    "Total ISR Savings",
+                    f"${total_savings:,.0f}",
+                    help="Estimated using Art. 9 LISR personas morales rate (30%)",
+                )
+            with d_kpis[3]:
+                avg_pf = [r["marginal_rate_pf"] for r in deductibility_items if r["marginal_rate_pf"] is not None]
+                if avg_pf:
+                    st.metric(
+                        "Avg PF Marginal",
+                        f"{(sum(avg_pf)/len(avg_pf))*100:.2f}%",
+                        help="Personas físicas marginal rate (Art. 96 LISR) — comparison only",
+                    )
+                else:
+                    st.metric("Avg PF Marginal", "n/a")
+
+            display_d = [c for c in [
+                "id", "product", "vendor", "category", "capex_opex", "status",
+                "annual_cost_usd", "is_deductible", "deductible_fraction",
+                "deductible_amount_usd", "estimated_isr_savings_usd",
+                "uses_contable_bot_constants",
+            ] if c in df_d.columns]
+
+            styled_d = df_d[display_d].style.format({
+                "annual_cost_usd": "${:,.0f}",
+                "deductible_fraction": "{:.0%}",
+                "deductible_amount_usd": "${:,.0f}",
+                "estimated_isr_savings_usd": "${:,.0f}",
+            })
+            st.dataframe(styled_d, use_container_width=True, hide_index=True)
+
+            # Show legal basis for first row as a sample
+            with st.expander("Legal basis used (first row sample)"):
+                st.write(deductibility_items[0]["legal_basis"])
+                st.caption(
+                    f"corp_isr_rate: {deductibility_items[0]['corp_isr_rate']:.0%} · "
+                    f"uses_contable_bot_constants: "
+                    f"{deductibility_items[0]['uses_contable_bot_constants']}"
+                )
 
 
 if __name__ == "__main__":

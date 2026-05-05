@@ -15,6 +15,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 import asset_tracker
+import fiscal_compliance
 import renewal_alerts
 import report_generator
 import schemas
@@ -276,6 +277,75 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             )
         except Exception as exc:
             logger.error("Error generating report: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # ----------------------------------------------------------------------
+    # Mexican fiscal compliance endpoints (Art. 25, 30-B, 69-B CFF/LISR)
+    # ----------------------------------------------------------------------
+
+    def _load_assets_for_fiscal() -> list[dict[str, Any]]:
+        """Helper used by every fiscal endpoint — handles db_path scoping."""
+        if db_path:
+            original_path = asset_tracker._DB_PATH
+            asset_tracker._DB_PATH = db_path
+            try:
+                return asset_tracker.get_assets()
+            finally:
+                asset_tracker._DB_PATH = original_path
+        return asset_tracker.get_assets()
+
+    @app.get("/fiscal/health")
+    def fiscal_health() -> dict[str, Any]:
+        """
+        Live state of the contable_bot RAG bridge and fiscal modules.
+        Cheap — no I/O. Useful as a Streamlit / monitoring probe.
+        """
+        try:
+            return fiscal_compliance.fiscal_healthcheck()
+        except Exception as exc:
+            logger.error("Error in fiscal_healthcheck: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/fiscal/risk-index")
+    def fiscal_risk_index() -> dict[str, Any]:
+        """
+        Composite portfolio fiscal risk score (0-100) with band, components,
+        and recommendations. Backed by Art. 30-B + Art. 69-B CFF assessments.
+        """
+        try:
+            assets = _load_assets_for_fiscal()
+            return fiscal_compliance.get_fiscal_risk_index(assets)
+        except Exception as exc:
+            logger.error("Error in fiscal_risk_index: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/fiscal/deductibility")
+    def fiscal_deductibility() -> dict[str, Any]:
+        """
+        Per-asset deductibility under Art. 25 LISR plus a portfolio-level
+        summary (total deductible, total estimated ISR savings, count).
+        """
+        try:
+            assets = _load_assets_for_fiscal()
+            items = [fiscal_compliance.get_asset_deductibility(a) for a in assets]
+            total_deductible = sum(r["deductible_amount_usd"] for r in items)
+            total_savings = sum(r["estimated_isr_savings_usd"] for r in items)
+            deductible_count = sum(1 for r in items if r["is_deductible"])
+            return {
+                "items": items,
+                "summary": {
+                    "asset_count": len(items),
+                    "deductible_count": deductible_count,
+                    "total_deductible_usd": round(total_deductible, 2),
+                    "total_estimated_isr_savings_usd": round(total_savings, 2),
+                    "corp_isr_rate": float(fiscal_compliance._CORP_ISR_RATE),
+                    "uses_contable_bot_constants": any(
+                        r.get("uses_contable_bot_constants") for r in items
+                    ),
+                },
+            }
+        except Exception as exc:
+            logger.error("Error in fiscal_deductibility: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return app

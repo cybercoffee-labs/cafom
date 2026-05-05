@@ -23,6 +23,7 @@ except ImportError as exc:
 import anomaly_detector
 import asset_tracker
 import financial_forecast
+import fiscal_compliance
 import renewal_alerts
 
 logger = logging.getLogger("cafom.report_generator")
@@ -280,6 +281,161 @@ def _build_anomalies(pdf: _CafomPDF, assets: list[dict[str, Any]]) -> None:
         pdf.ln()
 
 
+def _build_fiscal_compliance(pdf: _CafomPDF, assets: list[dict[str, Any]]) -> None:
+    """Page 7 — Mexican fiscal compliance summary (Art. 25, 30-B, 69-B)."""
+    pdf.add_page()
+    _section_title(pdf, "Mexican Fiscal Compliance (CFF / LISR)")
+
+    # ---- Risk Index header ----
+    try:
+        idx = fiscal_compliance.get_fiscal_risk_index(assets)
+    except Exception as exc:
+        logger.warning("get_fiscal_risk_index failed: %s", exc)
+        idx = {"score": 0.0, "band": "n/a", "components": {}, "recommendations": []}
+
+    band = idx.get("band", "n/a")
+    score = float(idx.get("score", 0.0) or 0.0)
+    band_color_map = {
+        "Bajo": _GREEN_OK,
+        "Revisión": _YELLOW_ALERT,
+        "Acción": _RED_ALERT,
+    }
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(*band_color_map.get(band, _HEADER_COLOR))
+    pdf.cell(0, 8, _safe(f"Fiscal Risk Index: {score:.2f} / 100  -  Banda: {band}"), ln=True)
+    pdf.set_text_color(0, 0, 0)
+    comps = idx.get("components", {}) or {}
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(
+        0, 6,
+        _safe(
+            f"Art. 30-B avg: {comps.get('art_30b_avg_score', 0):.1f}  |  "
+            f"EFOS review: {comps.get('efos_review_pct', 0):.1f}%  |  "
+            f"High-surveillance: {comps.get('high_surveillance_pct', 0):.1f}%"
+        ),
+        ln=True,
+    )
+    pdf.ln(2)
+
+    recs = idx.get("recommendations", []) or []
+    if recs:
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, _safe("Recommendations:"), ln=True)
+        pdf.set_font("Helvetica", "", 8)
+        for r in recs:
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(0, 5, _safe("- " + r))
+        pdf.ln(2)
+
+    # ---- Top risk assets (Art. 30-B) ----
+    try:
+        art30 = fiscal_compliance.validate_art_30_b(assets)
+    except Exception as exc:
+        logger.warning("validate_art_30_b failed: %s", exc)
+        art30 = {"items": []}
+
+    items = (art30.get("items") or [])[:5]
+    if items:
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, _safe("Top risk assets (Art. 30-B CFF):"), ln=True)
+        pdf.ln(1)
+
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(220, 230, 220)
+        cols = [
+            ("ID", 22), ("Product", 55), ("Category", 35),
+            ("Risk", 16), ("SAT score", 22),
+        ]
+        for h, w in cols:
+            pdf.cell(w, 6, _safe(h), border=1, fill=True)
+        pdf.ln()
+
+        pdf.set_font("Helvetica", "", 8)
+        for it in items:
+            pdf.cell(22, 5, _safe(it.get("id", "")), border=1)
+            pdf.cell(55, 5, _safe(it.get("product", ""))[:35], border=1)
+            pdf.cell(35, 5, _safe(it.get("category", ""))[:22], border=1)
+            pdf.cell(16, 5, _safe(it.get("risk_level", "")), border=1)
+            pdf.cell(22, 5, _safe(it.get("sat_readiness_score", "")), border=1, align="R")
+            pdf.ln()
+        pdf.ln(2)
+
+    # ---- EFOS vendors needing review (Art. 69-B) ----
+    try:
+        vendor_names = sorted({a.get("vendor") for a in assets if a.get("vendor")})
+        efos = fiscal_compliance.verify_efos_status(list(vendor_names))
+    except Exception as exc:
+        logger.warning("verify_efos_status failed: %s", exc)
+        efos = {"items": [], "summary": {"needs_review": 0, "clean": 0, "total_vendors": 0}}
+
+    needing = [r for r in (efos.get("items") or []) if r.get("efos_status") == "Revisión requerida"]
+    summ = efos.get("summary", {}) or {}
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(
+        0, 6,
+        _safe(
+            f"EFOS verification (Art. 69-B CFF) - {summ.get('clean', 0)}/"
+            f"{summ.get('total_vendors', 0)} verified, "
+            f"{summ.get('needs_review', 0)} need review"
+        ),
+        ln=True,
+    )
+    if needing:
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*_RED_ALERT)
+        for r in needing:
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(
+                0, 5,
+                _safe(
+                    f"- {r.get('vendor', '')}: {r.get('efos_status', '')} "
+                    f"-> {r.get('action', '')}"
+                ),
+            )
+        pdf.set_text_color(0, 0, 0)
+    else:
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.cell(0, 5, _safe("No vendors flagged for EFOS review."), ln=True)
+    pdf.ln(2)
+
+    # ---- Deductibility (Art. 25 LISR) totals ----
+    try:
+        deductibility = [fiscal_compliance.get_asset_deductibility(a) for a in assets]
+    except Exception as exc:
+        logger.warning("get_asset_deductibility failed: %s", exc)
+        deductibility = []
+
+    if deductibility:
+        total_deductible = sum(r["deductible_amount_usd"] for r in deductibility)
+        total_savings = sum(r["estimated_isr_savings_usd"] for r in deductibility)
+        deductible_count = sum(1 for r in deductibility if r["is_deductible"])
+
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, _safe("Deductibility summary (Art. 25 LISR):"), ln=True)
+
+        _kv_row(pdf, "Deductible assets:", f"{deductible_count} / {len(deductibility)}")
+        _kv_row(pdf, "Total deductible amount:", f"${total_deductible:,.2f}")
+        _kv_row(pdf, "Estimated ISR savings:", f"${total_savings:,.2f}")
+        _kv_row(
+            pdf, "Corp ISR rate (Art. 9):",
+            f"{float(fiscal_compliance._CORP_ISR_RATE)*100:.1f}%",
+        )
+        pdf.ln(2)
+
+    # ---- Footer disclaimer ----
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(
+        0, 4,
+        _safe(
+            "Powered by contable_bot RAG (82 Mexican fiscal documents). "
+            "Not legal advice; verify against current SAT publications."
+        ),
+    )
+    pdf.set_text_color(0, 0, 0)
+
+
 def build_report(
     assets: list[dict[str, Any]] | None = None,
     output_path: Path | None = None,
@@ -310,6 +466,7 @@ def build_report(
     _build_renewals(pdf, assets)
     _build_forecast(pdf, assets)
     _build_anomalies(pdf, assets)
+    _build_fiscal_compliance(pdf, assets)
 
     pdf_bytes = bytes(pdf.output())
 
