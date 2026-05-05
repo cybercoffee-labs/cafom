@@ -16,6 +16,7 @@ from datetime import date
 
 import anomaly_detector
 import asset_tracker
+import executive_kpis
 import financial_forecast
 import historical_analysis
 import market_data
@@ -256,6 +257,79 @@ def main():
         else:
             st.info("No active renewal alerts.")
 
+        # Critical Gap Recovery Plan — executive view of overdue exposure
+        gap = executive_kpis.get_critical_gap_recovery(assets)
+        with st.expander(
+            f"🚨 Critical Gap Recovery Plan "
+            f"({gap['count']} overdue · ${gap['total_exposure']:,.0f} exposure)",
+            expanded=gap["count"] > 0,
+        ):
+            if gap["items"]:
+                gap_df = pd.DataFrame(gap["items"])
+
+                # Style: highlight recommended_action by severity
+                def _action_color(val):
+                    if val == "Replace":
+                        return "background-color: #4a0000; color: #ffaaaa"
+                    if val == "Negotiate":
+                        return "background-color: #5a3a00; color: #ffd9a3"
+                    if val == "Renew immediately":
+                        return "background-color: #003a1a; color: #aaffcf"
+                    return ""
+
+                display_cols = [
+                    "id", "product", "vendor", "category",
+                    "renewal_date", "days_past_renewal",
+                    "annual_cost_usd", "daily_cost", "financial_exposure",
+                    "recommended_action",
+                ]
+                display_cols = [c for c in display_cols if c in gap_df.columns]
+                styled = gap_df[display_cols].style.format({
+                    "annual_cost_usd": "${:,.2f}",
+                    "daily_cost": "${:,.2f}",
+                    "financial_exposure": "${:,.2f}",
+                }).map(_action_color, subset=["recommended_action"])
+                st.dataframe(styled, use_container_width=True)
+
+                kpi_a, kpi_b, kpi_c = st.columns(3)
+                with kpi_a:
+                    st.metric("Total Overdue", f"{gap['count']} assets")
+                with kpi_b:
+                    st.metric("Total Exposure", f"${gap['total_exposure']:,.0f}")
+                with kpi_c:
+                    top = gap["items"][0]
+                    st.metric(
+                        "Largest Risk",
+                        top["product"][:18] + ("…" if len(top["product"]) > 18 else ""),
+                        delta=f"${top['financial_exposure']:,.0f}",
+                        delta_color="inverse",
+                    )
+
+                # Also show category-level coverage lost
+                lost = executive_kpis.get_days_of_coverage_lost(assets)
+                if lost["by_category"]:
+                    st.caption(
+                        f'**Days of Coverage Lost:** {lost["total_days_lost"]} cumulative days · '
+                        f'**Total Risk:** ${lost["total_financial_risk"]:,.0f}'
+                    )
+                    cat_rows = [
+                        {
+                            "Category": cat,
+                            "Days Lost": data["days_lost"],
+                            "Financial Risk": data["financial_risk"],
+                            "Assets": data["asset_count"],
+                        }
+                        for cat, data in lost["by_category"].items()
+                    ]
+                    cat_df = pd.DataFrame(cat_rows)
+                    cat_df = cat_df.sort_values("Financial Risk", ascending=False)
+                    cat_styled = cat_df.style.format({
+                        "Financial Risk": "${:,.2f}",
+                    })
+                    st.dataframe(cat_styled, use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ No overdue contracts — portfolio is current.")
+
     # --- Tab 4: Financial Intelligence ---
     with tab4:
         col_h, col_dl = st.columns([4, 1])
@@ -424,6 +498,38 @@ def main():
                     f"{variance:+.2f}%",
                     delta="Under budget" if variance < 0 else "Over budget",
                     delta_color="normal" if variance < 0 else "inverse",
+                )
+
+            # Cumulative burn rate trajectory (executive KPI view)
+            st.markdown("**Cumulative Trajectory — are we converging over- or under-budget?**")
+            trend = executive_kpis.get_monthly_burn_rate_trend(enriched)
+            df_cum = pd.DataFrame({
+                "Month": trend["months"],
+                "Cumulative Actual": trend["cumulative_actual"],
+                "Cumulative Budget": trend["cumulative_budget"],
+            }).set_index("Month")
+            st.line_chart(df_cum)
+
+            cum_cols = st.columns(2)
+            with cum_cols[0]:
+                eoy = trend["end_of_year_variance_pct"]
+                st.metric(
+                    "End-of-Year Variance",
+                    f"{eoy:+.2f}%",
+                    delta=trend["trending"],
+                    delta_color=(
+                        "normal" if trend["trending"] == "Under budget"
+                        else "inverse" if trend["trending"] == "Over budget"
+                        else "off"
+                    ),
+                )
+            with cum_cols[1]:
+                # Variance at mid-year (June, index 5) for an early signal
+                mid_year_pct = trend["cumulative_variance_pct"][5]
+                st.metric(
+                    "Mid-Year Variance (Jun)",
+                    f"{mid_year_pct:+.2f}%",
+                    help="Cumulative variance at month 6 — early-warning signal",
                 )
         else:
             st.info("Burn rate unavailable.")
