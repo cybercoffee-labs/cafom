@@ -1,0 +1,23 @@
+# CAFOM — Dark cybersecurity-themed Streamlit theme
+# Inspired by terminal/SOC dashboards: deep navy + matrix green.
+
+[theme]
+base = "dark"
+primaryColor = "#00ff41"            # Matrix/cybersecurity green — primary accents, buttons, highlights
+backgroundColor = "#0e1117"         # Main canvas — deep near-black blue
+secondaryBackgroundColor = "#1a1c23" # Sidebar, cards, expanders
+textColor = "#e6edf3"               # Soft white for primary text
+font = "monospace"                  # Monospace for that SOC-terminal feel
+
+[server]
+headless = true
+runOnSave = true
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = true
+toolbarMode = "minimal"
