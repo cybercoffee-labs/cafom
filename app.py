@@ -194,7 +194,7 @@ def main():
                         return "background-color: #ffd4d4"
                     return ""
 
-                df_styled = df_health.style.applymap(
+                df_styled = df_health.style.map(
                     color_status, subset=["Status"]
                 )
                 st.dataframe(df_styled, use_container_width=True)
